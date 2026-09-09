@@ -1052,9 +1052,9 @@ get_peb32(HANDLE process, HANDLE thread)
     NTSTATUS res = query_thread_info(thread, &info);
     if (!NT_SUCCESS(res))
         return 0;
-    /* Bizarrely, info.TebBaseAddress points 2 pages too low!  We do sanity
-     * checks to confirm we have a TEB by looking at its self pointer.
-     */
+        /* Bizarrely, info.TebBaseAddress points 2 pages too low!  We do sanity
+         * checks to confirm we have a TEB by looking at its self pointer.
+         */
 #    define TEB32_QUERY_OFFS 0x2000
     byte *teb32 = (byte *)info.TebBaseAddress;
     uint ptr32;
@@ -2270,6 +2270,16 @@ nt_remote_query_virtual_memory(HANDLE process, const byte *pc,
     memset(mbi, 0, sizeof(MEMORY_BASIC_INFORMATION));
     return NT_SYSCALL(QueryVirtualMemory, process, pc, MemoryBasicInformation, mbi,
                       mbilen, (PSIZE_T)got);
+}
+
+NTSTATUS
+query_memory_image_extension(const byte *module_base,
+                             MEMORY_IMAGE_EXTENSION_INFORMATION *info, size_t *got)
+{
+    memset(info, 0, sizeof(*info));
+    *got = 0;
+    return NT_SYSCALL(QueryVirtualMemory, NT_CURRENT_PROCESS, module_base,
+                      MemoryImageExtensionInformation, info, sizeof(*info), (PSIZE_T)got);
 }
 
 /* We use this instead of VirtualQuery b/c there are problems using
