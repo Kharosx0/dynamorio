@@ -101,8 +101,25 @@ typedef enum _MEMORY_INFORMATION_CLASS {
     MemoryBasicInformation,
     MemoryWorkingSetList,
     MemorySectionName,
-    MemoryBasicVlmInformation
+    MemoryBasicVlmInformation,
+    MemoryImageExtensionInformation = 14
 } MEMORY_INFORMATION_CLASS;
+
+/* Windows 11 24H2 added image-extension queries used for per-image CFG
+ * support.  These definitions are not yet available in the Windows SDK.
+ */
+typedef enum _MEMORY_IMAGE_EXTENSION_TYPE {
+    MemoryImageExtensionCfgScp,
+    MemoryImageExtensionCfgEmulatedScp,
+    MemoryImageExtensionTypeMax,
+} MEMORY_IMAGE_EXTENSION_TYPE;
+
+typedef struct _MEMORY_IMAGE_EXTENSION_INFORMATION {
+    MEMORY_IMAGE_EXTENSION_TYPE ExtensionType;
+    ULONG Flags;
+    PVOID ExtensionImageBaseRva;
+    SIZE_T ExtensionSize;
+} MEMORY_IMAGE_EXTENSION_INFORMATION;
 
 /* from DDK2003SP1/3790.1830/inc/ddk/wnet/ntddk.h */
 typedef enum _PROCESSINFOCLASS {

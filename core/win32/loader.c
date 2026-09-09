@@ -988,6 +988,777 @@ privload_unload_imports(privmod_t *mod)
     return true;
 }
 
+#if defined(X86) && defined(X64)
+
+#    define PRIVLOAD_DYNAMIC_RELOCATION_FUNCTION_OVERRIDE 7
+#    define PRIVLOAD_FUNCTION_OVERRIDE_INVALID 0
+#    define PRIVLOAD_FUNCTION_OVERRIDE_X64_REL32 1
+
+typedef enum {
+    PRIVLOAD_DVRT_NOT_APPLICABLE,
+    PRIVLOAD_DVRT_SUPPORTED,
+    PRIVLOAD_DVRT_UNSUPPORTED,
+    PRIVLOAD_DVRT_MALFORMED,
+} privload_dvrt_status_t;
+
+#    pragma pack(push, 1)
+typedef struct _privload_dvrt_header_t {
+    uint version;
+    uint size;
+} privload_dvrt_header_t;
+
+typedef struct _privload_dvrt_record64_t {
+    uint64 symbol;
+    uint payload_size;
+} privload_dvrt_record64_t;
+#    pragma pack(pop)
+
+typedef struct _privload_function_override_header_t {
+    uint override_info_size;
+} privload_function_override_header_t;
+
+typedef struct _privload_function_override_info_t {
+    uint original_rva;
+    uint bdd_offset;
+    uint rva_size;
+    uint reloc_size;
+} privload_function_override_info_t;
+
+typedef bool (*privload_function_override_cb_t)(
+    app_pc image_base, size_t image_size, const privload_function_override_info_t *info,
+    const uint *replacement_rvas, uint operand_rva, void *user_data);
+
+static bool
+privload_range_in_image(app_pc image_base, size_t image_size, const void *address,
+                        size_t size)
+{
+    ptr_uint_t image_start = (ptr_uint_t)image_base;
+    ptr_uint_t range_start = (ptr_uint_t)address;
+    size_t offset;
+
+    if (range_start < image_start)
+        return false;
+    offset = range_start - image_start;
+    return offset <= image_size && size <= image_size - offset;
+}
+
+static privload_dvrt_status_t
+privload_find_dvrt(app_pc image_base, size_t image_size,
+                   const privload_dvrt_header_t **table OUT)
+{
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_DATA_DIRECTORY *dir;
+    IMAGE_LOAD_CONFIG_DIRECTORY64 *config64;
+    byte *config;
+    uint config_size;
+    uint effective_size;
+    app_pc table_from_section = NULL;
+    app_pc table_address;
+    uint table_offset;
+    ushort table_section;
+    const privload_dvrt_header_t *header;
+
+    *table = NULL;
+    if (!is_readable_pe_base(image_base))
+        return PRIVLOAD_DVRT_MALFORMED;
+
+    dos = (IMAGE_DOS_HEADER *)image_base;
+    nt = (IMAGE_NT_HEADERS *)(image_base + dos->e_lfanew);
+    if (OPT_HDR(nt, Magic) != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return PRIVLOAD_DVRT_NOT_APPLICABLE;
+
+    dir = OPT_HDR(nt, DataDirectory) + IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG;
+    if (dir->VirtualAddress == 0 || dir->Size < sizeof(config_size))
+        return PRIVLOAD_DVRT_NOT_APPLICABLE;
+    config = image_base + dir->VirtualAddress;
+    if (!privload_range_in_image(image_base, image_size, config, dir->Size) ||
+        !is_readable_without_exception(config, dir->Size))
+        return PRIVLOAD_DVRT_MALFORMED;
+
+    config_size = *(uint *)config;
+    effective_size = MIN(config_size, dir->Size);
+    config64 = (IMAGE_LOAD_CONFIG_DIRECTORY64 *)config;
+    if (effective_size >=
+        offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, DynamicValueRelocTableSection) +
+            sizeof(config64->DynamicValueRelocTableSection)) {
+        IMAGE_SECTION_HEADER *section;
+        uint section_size;
+
+        table_offset = config64->DynamicValueRelocTableOffset;
+        table_section = config64->DynamicValueRelocTableSection;
+        if (table_section != 0 || table_offset != 0) {
+            if (table_section == 0 || table_section > nt->FileHeader.NumberOfSections)
+                return PRIVLOAD_DVRT_MALFORMED;
+            section = IMAGE_FIRST_SECTION(nt) + table_section - 1;
+            section_size = MAX(section->Misc.VirtualSize, section->SizeOfRawData);
+            if (table_offset > section_size)
+                return PRIVLOAD_DVRT_MALFORMED;
+            table_from_section = image_base + section->VirtualAddress + table_offset;
+            if (!privload_range_in_image(image_base, image_size, table_from_section,
+                                         sizeof(*header)))
+                return PRIVLOAD_DVRT_MALFORMED;
+        }
+    }
+
+    table_address = table_from_section;
+    if (table_address == NULL)
+        return PRIVLOAD_DVRT_NOT_APPLICABLE;
+    if (!privload_range_in_image(image_base, image_size, table_address,
+                                 sizeof(*header)) ||
+        !is_readable_without_exception(table_address, sizeof(*header)))
+        return PRIVLOAD_DVRT_MALFORMED;
+
+    header = (const privload_dvrt_header_t *)table_address;
+    if (header->version != 1)
+        return PRIVLOAD_DVRT_UNSUPPORTED;
+    if (!privload_range_in_image(image_base, image_size, header + 1, header->size) ||
+        !is_readable_without_exception((const byte *)(header + 1), header->size))
+        return PRIVLOAD_DVRT_MALFORMED;
+
+    *table = header;
+    return PRIVLOAD_DVRT_SUPPORTED;
+}
+
+static privload_dvrt_status_t
+privload_walk_function_overrides(app_pc image_base, size_t image_size,
+                                 const privload_dvrt_header_t *table,
+                                 privload_function_override_cb_t callback,
+                                 void *user_data)
+{
+    const byte *cursor = (const byte *)(table + 1);
+    const byte *table_end = cursor + table->size;
+
+    while (cursor < table_end) {
+        const privload_dvrt_record64_t *record;
+        const byte *payload;
+        const byte *record_end;
+
+        if ((size_t)(table_end - cursor) < sizeof(*record))
+            return PRIVLOAD_DVRT_MALFORMED;
+        record = (const privload_dvrt_record64_t *)cursor;
+        payload = cursor + sizeof(*record);
+        if (record->payload_size > (size_t)(table_end - payload))
+            return PRIVLOAD_DVRT_MALFORMED;
+        record_end = payload + record->payload_size;
+
+        if (record->symbol == PRIVLOAD_DYNAMIC_RELOCATION_FUNCTION_OVERRIDE) {
+            const privload_function_override_header_t *header;
+            const byte *info_cursor;
+            const byte *info_end;
+
+            if ((size_t)(record_end - payload) < sizeof(*header))
+                return PRIVLOAD_DVRT_MALFORMED;
+            header = (const privload_function_override_header_t *)payload;
+            info_cursor = payload + sizeof(*header);
+            if (header->override_info_size > (size_t)(record_end - info_cursor))
+                return PRIVLOAD_DVRT_MALFORMED;
+            info_end = info_cursor + header->override_info_size;
+
+            while (info_cursor < info_end) {
+                const privload_function_override_info_t *info;
+                const uint *replacement_rvas;
+                const byte *reloc_cursor;
+                const byte *reloc_end;
+                uint last_operand_rva = 0;
+                bool have_operand = false;
+
+                if ((size_t)(info_end - info_cursor) < sizeof(*info))
+                    return PRIVLOAD_DVRT_MALFORMED;
+                info = (const privload_function_override_info_t *)info_cursor;
+                if (!ALIGNED(info->rva_size, sizeof(uint)) ||
+                    info->rva_size > (size_t)(info_end - info_cursor - sizeof(*info)))
+                    return PRIVLOAD_DVRT_MALFORMED;
+                replacement_rvas = (const uint *)(info_cursor + sizeof(*info));
+                reloc_cursor = info_cursor + sizeof(*info) + info->rva_size;
+                if (info->reloc_size > (size_t)(info_end - reloc_cursor))
+                    return PRIVLOAD_DVRT_MALFORMED;
+                reloc_end = reloc_cursor + info->reloc_size;
+
+                while (reloc_cursor < reloc_end) {
+                    const IMAGE_BASE_RELOCATION *block;
+                    const ushort *entry;
+                    const byte *block_end;
+
+                    if ((size_t)(reloc_end - reloc_cursor) < IMAGE_SIZEOF_BASE_RELOCATION)
+                        return PRIVLOAD_DVRT_MALFORMED;
+                    block = (const IMAGE_BASE_RELOCATION *)reloc_cursor;
+                    if (block->SizeOfBlock < IMAGE_SIZEOF_BASE_RELOCATION ||
+                        block->SizeOfBlock > (size_t)(reloc_end - reloc_cursor) ||
+                        !ALIGNED(block->SizeOfBlock - IMAGE_SIZEOF_BASE_RELOCATION,
+                                 sizeof(ushort)))
+                        return PRIVLOAD_DVRT_MALFORMED;
+                    block_end = reloc_cursor + block->SizeOfBlock;
+                    entry = (const ushort *)(reloc_cursor + IMAGE_SIZEOF_BASE_RELOCATION);
+                    while ((const byte *)entry < block_end) {
+                        uint type = *entry >> 12;
+                        size_t operand_offset =
+                            (size_t)block->VirtualAddress + (*entry & 0xfff);
+                        uint operand_rva;
+
+                        if (type == PRIVLOAD_FUNCTION_OVERRIDE_X64_REL32) {
+                            if (operand_offset > UINT_MAX ||
+                                operand_offset > image_size ||
+                                sizeof(int) > image_size - operand_offset)
+                                return PRIVLOAD_DVRT_MALFORMED;
+                            operand_rva = (uint)operand_offset;
+                            if (have_operand &&
+                                operand_rva < last_operand_rva + sizeof(int))
+                                return PRIVLOAD_DVRT_UNSUPPORTED;
+                            last_operand_rva = operand_rva;
+                            have_operand = true;
+                            if (!(*callback)(image_base, image_size, info,
+                                             replacement_rvas, operand_rva, user_data))
+                                return PRIVLOAD_DVRT_UNSUPPORTED;
+                        }
+                        entry++;
+                    }
+                    reloc_cursor = block_end;
+                }
+                info_cursor = reloc_end;
+            }
+        }
+        cursor = record_end;
+    }
+    return cursor == table_end ? PRIVLOAD_DVRT_SUPPORTED : PRIVLOAD_DVRT_MALFORMED;
+}
+
+#    define DR_PAGE_TARGETS_NO_UPDATE 0x40000000
+
+typedef enum {
+    PRIVLOAD_CFG_DISPATCH,
+    PRIVLOAD_CFG_DISPATCH_ES,
+    PRIVLOAD_CFG_CHECK,
+    PRIVLOAD_CFG_CHECK_ES,
+    PRIVLOAD_CFG_INVALID_CALL,
+    PRIVLOAD_CFG_ROLE_COUNT,
+} privload_cfg_role_t;
+
+/* Windows 11 24H2 image-extension pages begin with RVAs for the CFG dispatch,
+ * dispatch-with-export-suppression, check, check-with-export-suppression,
+ * invalid-call, and runtime-function-table entries.  We validate every RVA
+ * against the queried extension range before using it.
+ */
+typedef struct _privload_cfg_extension_header_t {
+    uint dispatch_rva;
+    uint dispatch_es_rva;
+    uint check_rva;
+    uint check_es_rva;
+    uint invalid_call_handler_rva;
+    uint function_table_rva;
+} privload_cfg_extension_header_t;
+
+typedef struct _privload_cfg_extension_t {
+    app_pc extension_base;
+    size_t extension_size;
+    MEMORY_IMAGE_EXTENSION_TYPE type;
+    uint flags;
+    privload_cfg_extension_header_t header;
+} privload_cfg_extension_t;
+
+typedef struct _privload_function_override_context_t {
+    app_pc source_context_base;
+    const privload_cfg_extension_t *source_extension;
+    const privload_cfg_extension_t *private_extension;
+    app_pc cached_source_base;
+    privload_cfg_extension_t cached_source_extension;
+    bool have_cached_source_extension;
+    bool apply;
+    uint repair_count;
+} privload_function_override_context_t;
+
+static bool
+privload_add_rel32(ptr_uint_t operand_end, int displacement, app_pc *target OUT)
+{
+    ptr_uint_t result = operand_end + (ptr_int_t)displacement;
+
+    if ((displacement >= 0 && result < operand_end) ||
+        (displacement < 0 && result > operand_end))
+        return false;
+    *target = (app_pc)result;
+    return true;
+}
+
+static bool
+privload_map_cfg_role(const privload_cfg_extension_t *source, app_pc source_target,
+                      const privload_cfg_extension_t *destination,
+                      app_pc *destination_target OUT)
+{
+    const uint *source_roles = &source->header.dispatch_rva;
+    const uint *destination_roles = &destination->header.dispatch_rva;
+    ptr_uint_t source_offset;
+    app_pc selected_target = NULL;
+    uint i;
+    uint matches = 0;
+
+    if (source_target < source->extension_base ||
+        source_target >= source->extension_base + source->extension_size)
+        return false;
+    source_offset = source_target - source->extension_base;
+    for (i = 0; i < PRIVLOAD_CFG_ROLE_COUNT; i++) {
+        if (source_roles[i] == source_offset) {
+            app_pc candidate;
+
+            if (destination_roles[i] >= destination->extension_size)
+                return false;
+            candidate = destination->extension_base + destination_roles[i];
+            if (selected_target != NULL && candidate != selected_target)
+                return false;
+            selected_target = candidate;
+            matches++;
+        }
+    }
+    if (matches == 0)
+        return false;
+    *destination_target = selected_target;
+    return true;
+}
+
+static privload_dvrt_status_t
+privload_get_cfg_extension(app_pc image_base, privload_cfg_extension_t *extension OUT)
+{
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS *nt;
+    MEMORY_IMAGE_EXTENSION_INFORMATION info;
+    MEMORY_BASIC_INFORMATION mbi;
+    size_t got;
+    size_t image_size;
+    ptr_uint_t extension_rva;
+    ptr_uint_t extension_address;
+    NTSTATUS status;
+    uint i;
+    const uint *roles;
+
+    memset(extension, 0, sizeof(*extension));
+    if (!is_readable_pe_base(image_base))
+        return PRIVLOAD_DVRT_MALFORMED;
+    dos = (IMAGE_DOS_HEADER *)image_base;
+    nt = (IMAGE_NT_HEADERS *)(image_base + dos->e_lfanew);
+    image_size = OPT_HDR(nt, SizeOfImage);
+
+    status = query_memory_image_extension(image_base, &info, &got);
+    if (status == STATUS_INVALID_INFO_CLASS ||
+        (NT_SUCCESS(status) && info.ExtensionSize == 0))
+        return PRIVLOAD_DVRT_NOT_APPLICABLE;
+    if (!NT_SUCCESS(status))
+        return PRIVLOAD_DVRT_UNSUPPORTED;
+    if (got != sizeof(info) || info.ExtensionType != MemoryImageExtensionCfgScp ||
+        info.Flags != 0)
+        return PRIVLOAD_DVRT_UNSUPPORTED;
+
+    extension_rva = (ptr_uint_t)info.ExtensionImageBaseRva;
+    if (extension_rva != image_size || info.ExtensionSize < sizeof(extension->header) ||
+        !ALIGNED(info.ExtensionSize, PAGE_SIZE))
+        return PRIVLOAD_DVRT_UNSUPPORTED;
+    extension_address = (ptr_uint_t)image_base + extension_rva;
+    if (extension_address < (ptr_uint_t)image_base)
+        return PRIVLOAD_DVRT_MALFORMED;
+    extension->extension_base = (app_pc)extension_address;
+    extension->extension_size = info.ExtensionSize;
+
+    if (query_virtual_memory(extension->extension_base, &mbi, sizeof(mbi)) !=
+            sizeof(mbi) ||
+        mbi.AllocationBase != image_base || mbi.State != MEM_COMMIT ||
+        mbi.Type != MEM_IMAGE || !prot_is_executable(mbi.Protect) ||
+        mbi.BaseAddress != extension->extension_base ||
+        mbi.RegionSize < extension->extension_size ||
+        !is_readable_without_exception(extension->extension_base,
+                                       sizeof(extension->header)))
+        return PRIVLOAD_DVRT_UNSUPPORTED;
+    memcpy(&extension->header, extension->extension_base, sizeof(extension->header));
+
+    roles = &extension->header.dispatch_rva;
+    for (i = 0; i < PRIVLOAD_CFG_ROLE_COUNT; i++) {
+        if (roles[i] >= extension->extension_size)
+            return PRIVLOAD_DVRT_UNSUPPORTED;
+    }
+
+    extension->type = info.ExtensionType;
+    extension->flags = info.Flags;
+    return PRIVLOAD_DVRT_SUPPORTED;
+}
+
+static bool
+privload_repair_function_override(app_pc image_base, size_t image_size,
+                                  const privload_function_override_info_t *info,
+                                  const uint *replacement_rvas, uint operand_rva,
+                                  void *user_data)
+{
+    privload_function_override_context_t *context =
+        (privload_function_override_context_t *)user_data;
+    privload_cfg_extension_t source_extension;
+    const privload_cfg_extension_t *selected_source_extension = NULL;
+    MEMORY_BASIC_INFORMATION source_mbi;
+    app_pc operand = image_base + operand_rva;
+    app_pc current_target;
+    app_pc source_target;
+    app_pc private_target;
+    ptr_uint_t source_operand_end;
+    ptr_int_t new_displacement;
+    ptr_uint_t first_page;
+    ptr_uint_t last_page;
+    uint old_prot[2];
+    uint ignored_prot;
+    uint writable_prot;
+    uint page_count;
+    uint pages_changed;
+    uint i;
+    int displacement;
+
+    (void)info;
+    (void)replacement_rvas;
+    if (operand_rva == 0 ||
+        !is_readable_without_exception(operand - 1, sizeof(displacement) + 1))
+        return true;
+    memcpy(&displacement, operand, sizeof(displacement));
+    if (!privload_add_rel32((ptr_uint_t)(operand + sizeof(displacement)), displacement,
+                            &current_target))
+        return true;
+    if (current_target >= image_base && current_target < image_base + image_size)
+        return true;
+    if (operand[-1] != 0xe9 && operand[-1] != 0xe8)
+        return true;
+
+    source_operand_end =
+        (ptr_uint_t)context->source_context_base + operand_rva + sizeof(displacement);
+    if (source_operand_end < (ptr_uint_t)context->source_context_base ||
+        !privload_add_rel32(source_operand_end, displacement, &source_target))
+        return true;
+    if (context->source_extension != NULL &&
+        source_target >= context->source_extension->extension_base &&
+        source_target < context->source_extension->extension_base +
+                context->source_extension->extension_size) {
+        selected_source_extension = context->source_extension;
+    } else if (query_virtual_memory(source_target, &source_mbi, sizeof(source_mbi)) ==
+                   sizeof(source_mbi) &&
+               source_mbi.State == MEM_COMMIT) {
+        if (source_mbi.AllocationBase != NULL && source_mbi.Type == MEM_IMAGE &&
+            prot_is_executable(source_mbi.Protect)) {
+            if (context->have_cached_source_extension &&
+                context->cached_source_base == source_mbi.AllocationBase) {
+                selected_source_extension = &context->cached_source_extension;
+            } else if (privload_get_cfg_extension((app_pc)source_mbi.AllocationBase,
+                                                  &source_extension) ==
+                       PRIVLOAD_DVRT_SUPPORTED) {
+                context->cached_source_base = source_mbi.AllocationBase;
+                context->cached_source_extension = source_extension;
+                context->have_cached_source_extension = true;
+                selected_source_extension = &context->cached_source_extension;
+            }
+        }
+    }
+    if (selected_source_extension == NULL)
+        return true;
+    if (context->private_extension == NULL ||
+        selected_source_extension->type != context->private_extension->type ||
+        selected_source_extension->flags != context->private_extension->flags ||
+        !privload_map_cfg_role(selected_source_extension, source_target,
+                               context->private_extension, &private_target))
+        return true;
+    if (current_target == private_target)
+        return true;
+
+    new_displacement =
+        (ptr_int_t)private_target - (ptr_int_t)(operand + sizeof(displacement));
+    if ((ptr_int_t)(int)new_displacement != new_displacement)
+        return true;
+
+    context->repair_count++;
+    if (!context->apply)
+        return true;
+
+    first_page = PAGE_START(operand);
+    last_page = PAGE_START(operand + sizeof(displacement) - 1);
+    page_count = first_page == last_page ? 1 : 2;
+    writable_prot = PAGE_EXECUTE_WRITECOPY | DR_PAGE_TARGETS_NO_UPDATE;
+    pages_changed = 0;
+    for (i = 0; i < page_count; i++) {
+        app_pc page = (app_pc)(first_page + i * PAGE_SIZE);
+
+        if (query_virtual_memory(page, &source_mbi, sizeof(source_mbi)) !=
+                sizeof(source_mbi) ||
+            source_mbi.State != MEM_COMMIT || !prot_is_executable(source_mbi.Protect) ||
+            !protect_virtual_memory(page, PAGE_SIZE, writable_prot, &old_prot[i]))
+            break;
+        pages_changed++;
+    }
+    if (pages_changed != page_count) {
+        while (pages_changed > 0) {
+            pages_changed--;
+            protect_virtual_memory(
+                (void *)(first_page + pages_changed * PAGE_SIZE), PAGE_SIZE,
+                old_prot[pages_changed] | DR_PAGE_TARGETS_NO_UPDATE, &ignored_prot);
+        }
+        return false;
+    }
+    displacement = (int)new_displacement;
+    memcpy(operand, &displacement, sizeof(displacement));
+    machine_cache_sync(operand - 1, operand + sizeof(displacement), true);
+    while (pages_changed > 0) {
+        pages_changed--;
+        if (!protect_virtual_memory(
+                (void *)(first_page + pages_changed * PAGE_SIZE), PAGE_SIZE,
+                old_prot[pages_changed] | DR_PAGE_TARGETS_NO_UPDATE, &ignored_prot))
+            return false;
+    }
+
+    LOG(GLOBAL, LOG_LOADER, 2,
+        "%s: repaired function-override operand at " PFX " to " PFX "\n", __FUNCTION__,
+        operand, private_target);
+    return true;
+}
+
+static bool
+privload_repair_function_overrides(app_pc image_base, size_t image_size,
+                                   app_pc source_context_base,
+                                   const privload_cfg_extension_t *source_extension)
+{
+    const privload_dvrt_header_t *table;
+    privload_dvrt_status_t table_status;
+    privload_dvrt_status_t extension_status;
+    privload_dvrt_status_t walk_status;
+    privload_cfg_extension_t private_extension;
+    privload_function_override_context_t context;
+
+    extension_status = privload_get_cfg_extension(image_base, &private_extension);
+    if (extension_status != PRIVLOAD_DVRT_SUPPORTED)
+        return true;
+
+    table_status = privload_find_dvrt(image_base, image_size, &table);
+    if (table_status == PRIVLOAD_DVRT_NOT_APPLICABLE ||
+        table_status == PRIVLOAD_DVRT_UNSUPPORTED)
+        return true;
+    if (table_status != PRIVLOAD_DVRT_SUPPORTED)
+        return false;
+
+    memset(&context, 0, sizeof(context));
+    context.source_context_base = source_context_base;
+    context.source_extension = source_extension;
+    context.private_extension = &private_extension;
+
+    walk_status = privload_walk_function_overrides(
+        image_base, image_size, table, privload_repair_function_override, &context);
+    if (walk_status != PRIVLOAD_DVRT_SUPPORTED)
+        return false;
+    if (context.repair_count == 0)
+        return true;
+
+    LOG(GLOBAL, LOG_LOADER, 2, "%s: validated %u function-override operand(s)\n",
+        __FUNCTION__, context.repair_count);
+    context.apply = true;
+    context.repair_count = 0;
+    walk_status = privload_walk_function_overrides(
+        image_base, image_size, table, privload_repair_function_override, &context);
+    return walk_status == PRIVLOAD_DVRT_SUPPORTED;
+}
+
+#    ifdef STANDALONE_UNIT_TEST
+
+typedef struct _privload_dvrt_test_context_t {
+    uint count;
+    uint operands[3];
+} privload_dvrt_test_context_t;
+
+static bool
+privload_dvrt_test_callback(app_pc image_base, size_t image_size,
+                            const privload_function_override_info_t *info,
+                            const uint *replacement_rvas, uint operand_rva,
+                            void *user_data)
+{
+    privload_dvrt_test_context_t *context = (privload_dvrt_test_context_t *)user_data;
+
+    EXPECT(image_base != NULL, true);
+    EXPECT(image_size, 0x2000);
+    EXPECT(info->original_rva == 0x180 || info->original_rva == 0x80, true);
+    EXPECT(info->rva_size, sizeof(uint));
+    EXPECT(replacement_rvas[0], info->original_rva);
+    EXPECT(context->count < BUFFER_SIZE_ELEMENTS(context->operands), true);
+    context->operands[context->count++] = operand_rva;
+    return true;
+}
+
+void
+unit_test_loader(void)
+{
+    byte image[0x2000] = { 0 };
+    byte storage[128] = { 0 };
+    byte *cursor;
+    byte *payload;
+    byte *info_start;
+    privload_dvrt_header_t *table = (privload_dvrt_header_t *)storage;
+    privload_dvrt_record64_t *unknown_record;
+    privload_dvrt_record64_t *override_record;
+    privload_function_override_header_t *override_header;
+    privload_function_override_info_t *info;
+    privload_function_override_info_t *second_info;
+    IMAGE_BASE_RELOCATION *block;
+    IMAGE_BASE_RELOCATION *second_block;
+    ushort *entries;
+    ushort *second_entries;
+    uint *replacement_rvas;
+    uint *second_replacement_rvas;
+    privload_dvrt_test_context_t context = { 0 };
+    privload_cfg_extension_t source_extension = { 0 };
+    privload_cfg_extension_t destination_extension = { 0 };
+    app_pc destination_target;
+    app_pc rel32_target;
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS *nt;
+    IMAGE_SECTION_HEADER *section;
+    IMAGE_LOAD_CONFIG_DIRECTORY64 *config;
+    privload_dvrt_header_t *image_table;
+    const privload_dvrt_header_t *found_table;
+
+    table->version = 1;
+    cursor = (byte *)(table + 1);
+
+    unknown_record = (privload_dvrt_record64_t *)cursor;
+    unknown_record->symbol = 0x1234;
+    unknown_record->payload_size = sizeof(uint);
+    cursor += sizeof(*unknown_record) + unknown_record->payload_size;
+
+    override_record = (privload_dvrt_record64_t *)cursor;
+    override_record->symbol = PRIVLOAD_DYNAMIC_RELOCATION_FUNCTION_OVERRIDE;
+    payload = cursor + sizeof(*override_record);
+    override_header = (privload_function_override_header_t *)payload;
+    info_start = payload + sizeof(*override_header);
+    info = (privload_function_override_info_t *)info_start;
+    info->original_rva = 0x180;
+    info->rva_size = sizeof(uint);
+    replacement_rvas = (uint *)(info + 1);
+    replacement_rvas[0] = info->original_rva;
+    block = (IMAGE_BASE_RELOCATION *)(replacement_rvas + 1);
+    block->VirtualAddress = 0x100;
+    block->SizeOfBlock = IMAGE_SIZEOF_BASE_RELOCATION + 4 * sizeof(ushort);
+    entries = (ushort *)(block + 1);
+    entries[0] = (PRIVLOAD_FUNCTION_OVERRIDE_X64_REL32 << 12) | 0x1;
+    entries[1] = (PRIVLOAD_FUNCTION_OVERRIDE_X64_REL32 << 12) | 0x5;
+    entries[2] = PRIVLOAD_FUNCTION_OVERRIDE_INVALID;
+    entries[3] = PRIVLOAD_FUNCTION_OVERRIDE_INVALID;
+    info->reloc_size = block->SizeOfBlock;
+    cursor = (byte *)block + block->SizeOfBlock;
+
+    second_info = (privload_function_override_info_t *)cursor;
+    second_info->original_rva = 0x80;
+    second_info->rva_size = sizeof(uint);
+    second_replacement_rvas = (uint *)(second_info + 1);
+    second_replacement_rvas[0] = second_info->original_rva;
+    second_block = (IMAGE_BASE_RELOCATION *)(second_replacement_rvas + 1);
+    second_block->VirtualAddress = 0x20;
+    second_block->SizeOfBlock = IMAGE_SIZEOF_BASE_RELOCATION + 2 * sizeof(ushort);
+    second_entries = (ushort *)(second_block + 1);
+    second_entries[0] = (PRIVLOAD_FUNCTION_OVERRIDE_X64_REL32 << 12) | 0x1;
+    second_entries[1] = PRIVLOAD_FUNCTION_OVERRIDE_INVALID;
+    second_info->reloc_size = second_block->SizeOfBlock;
+    cursor = (byte *)second_block + second_block->SizeOfBlock;
+
+    ASSERT_TRUNCATE(override_header->override_info_size, uint, cursor - info_start);
+    ASSERT_TRUNCATE(override_record->payload_size, uint, cursor - payload);
+    ASSERT_TRUNCATE(table->size, uint, cursor - (byte *)(table + 1));
+    override_header->override_info_size = (uint)(cursor - info_start);
+    override_record->payload_size = (uint)(cursor - payload);
+    table->size = (uint)(cursor - (byte *)(table + 1));
+
+    EXPECT(privload_walk_function_overrides(image, sizeof(image), table,
+                                            privload_dvrt_test_callback, &context),
+           PRIVLOAD_DVRT_SUPPORTED);
+    EXPECT(context.count, 3);
+    EXPECT(context.operands[0], 0x101);
+    EXPECT(context.operands[1], 0x105);
+    EXPECT(context.operands[2], 0x21);
+
+    entries[1] = (PRIVLOAD_FUNCTION_OVERRIDE_X64_REL32 << 12) | 0x2;
+    context.count = 0;
+    EXPECT(privload_walk_function_overrides(image, sizeof(image), table,
+                                            privload_dvrt_test_callback, &context),
+           PRIVLOAD_DVRT_UNSUPPORTED);
+    entries[1] = (PRIVLOAD_FUNCTION_OVERRIDE_X64_REL32 << 12) | 0x5;
+
+    entries[0] = (2 << 12) | 0x1;
+    context.count = 0;
+    EXPECT(privload_walk_function_overrides(image, sizeof(image), table,
+                                            privload_dvrt_test_callback, &context),
+           PRIVLOAD_DVRT_SUPPORTED);
+    EXPECT(context.count, 2);
+    entries[0] = (PRIVLOAD_FUNCTION_OVERRIDE_X64_REL32 << 12) | 0x1;
+
+    block->SizeOfBlock = IMAGE_SIZEOF_BASE_RELOCATION - 1;
+    context.count = 0;
+    EXPECT(privload_walk_function_overrides(image, sizeof(image), table,
+                                            privload_dvrt_test_callback, &context),
+           PRIVLOAD_DVRT_MALFORMED);
+    block->SizeOfBlock = IMAGE_SIZEOF_BASE_RELOCATION + 4 * sizeof(ushort);
+
+    table->size--;
+    context.count = 0;
+    EXPECT(privload_walk_function_overrides(image, sizeof(image), table,
+                                            privload_dvrt_test_callback, &context),
+           PRIVLOAD_DVRT_MALFORMED);
+    table->size++;
+
+    EXPECT(privload_add_rel32(0x1000, 0x20, &rel32_target), true);
+    EXPECT(rel32_target, (app_pc)0x1020);
+    EXPECT(privload_add_rel32((ptr_uint_t)-2, 4, &rel32_target), false);
+    EXPECT(privload_add_rel32(1, -4, &rel32_target), false);
+
+    source_extension.extension_base = (app_pc)0x1000;
+    source_extension.extension_size = PAGE_SIZE;
+    source_extension.header.dispatch_rva = 0xc0;
+    source_extension.header.dispatch_es_rva = 0xc0;
+    destination_extension.extension_base = (app_pc)0x3000;
+    destination_extension.extension_size = PAGE_SIZE;
+    destination_extension.header.dispatch_rva = 0x40;
+    destination_extension.header.dispatch_es_rva = 0x40;
+    EXPECT(privload_map_cfg_role(&source_extension, (app_pc)0x10c0,
+                                 &destination_extension, &destination_target),
+           true);
+    EXPECT(destination_target, (app_pc)0x3040);
+    destination_extension.header.dispatch_es_rva = 0xc0;
+    EXPECT(privload_map_cfg_role(&source_extension, (app_pc)0x10c0,
+                                 &destination_extension, &destination_target),
+           false);
+
+    memset(image, 0, sizeof(image));
+    dos = (IMAGE_DOS_HEADER *)image;
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = 0x40;
+    nt = (IMAGE_NT_HEADERS *)(image + dos->e_lfanew);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.NumberOfSections = 1;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(nt->OptionalHeader);
+    nt->OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt->OptionalHeader.SizeOfImage = sizeof(image);
+    nt->OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].VirtualAddress =
+        0x200;
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size =
+        sizeof(*config);
+    section = IMAGE_FIRST_SECTION(nt);
+    section->VirtualAddress = 0x400;
+    section->Misc.VirtualSize = 0x200;
+    config = (IMAGE_LOAD_CONFIG_DIRECTORY64 *)(image + 0x200);
+    config->Size = sizeof(*config);
+    config->DynamicValueRelocTableOffset = 0x20;
+    config->DynamicValueRelocTableSection = 1;
+    image_table = (privload_dvrt_header_t *)(image + 0x420);
+    image_table->version = 1;
+    image_table->size = 0;
+    EXPECT(privload_find_dvrt(image, sizeof(image), &found_table),
+           PRIVLOAD_DVRT_SUPPORTED);
+    EXPECT(found_table, image_table);
+    image_table->version = 2;
+    EXPECT(privload_find_dvrt(image, sizeof(image), &found_table),
+           PRIVLOAD_DVRT_UNSUPPORTED);
+    image_table->version = 1;
+    image_table->size = sizeof(image);
+    EXPECT(privload_find_dvrt(image, sizeof(image), &found_table),
+           PRIVLOAD_DVRT_MALFORMED);
+}
+
+#    endif /* STANDALONE_UNIT_TEST */
+
+#endif /* X86 && X64 */
+
 /* if anything fails, undoes the mapping and returns NULL */
 app_pc
 privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
@@ -996,6 +1767,10 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
     file_t fd;
     app_pc map;
     app_pc pref;
+#if defined(X86) && defined(X64)
+    privload_cfg_extension_t source_extension;
+    bool have_source_extension = false;
+#endif
     byte *(*map_func)(file_t, size_t *, uint64, app_pc, uint, map_flags_t);
     bool (*unmap_func)(file_t, size_t);
     ASSERT(size != NULL);
@@ -1057,6 +1832,11 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
                get_application_pid(), filename);
         return NULL;
     }
+#if defined(X86) && defined(X64)
+    if (map != NULL && !TESTANY(MODLOAD_NOT_PRIVLIB, flags) &&
+        privload_get_cfg_extension(map, &source_extension) == PRIVLOAD_DVRT_SUPPORTED)
+        have_source_extension = true;
+#endif
 #ifdef X64
     if (TESTANY(MODLOAD_REACHABLE, flags)) {
         bool reloc = module_file_relocatable(map);
@@ -1102,6 +1882,17 @@ privload_map_and_relocate(const char *filename, size_t *size DR_PARAM_OUT,
             return NULL;
         }
     }
+#if defined(X86) && defined(X64)
+    if (!TESTANY(MODLOAD_NOT_PRIVLIB, flags) &&
+        !privload_repair_function_overrides(
+            map, *size, pref, have_source_extension ? &source_extension : NULL)) {
+        SYSLOG_INTERNAL_WARNING("failed to repair function overrides in %s", filename);
+        LOG(GLOBAL, LOG_LOADER, 1, "%s: failed to repair function overrides in %s\n",
+            __FUNCTION__, filename);
+        (*unmap_func)(map, *size);
+        return NULL;
+    }
+#endif
 
     return map;
 }

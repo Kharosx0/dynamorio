@@ -60,6 +60,10 @@ unit_test_opnd_shared(void);
 #ifdef WINDOWS
 void
 unit_test_drwinapi(void);
+#    if defined(X86) && defined(X64)
+void
+unit_test_loader(void);
+#    endif
 #endif
 void
 unit_test_asm(dcontext_t *dc);
@@ -89,6 +93,9 @@ main(int argc, char **argv, char **envp)
     unit_test_options();
     unit_test_vmareas();
 #ifdef WINDOWS
+#    if defined(X86) && defined(X64)
+    unit_test_loader();
+#    endif
     unit_test_drwinapi();
 #endif
     unit_test_asm(dc);

@@ -1370,6 +1370,10 @@ NTSTATUS
 nt_remote_query_virtual_memory(HANDLE process, const byte *pc,
                                MEMORY_BASIC_INFORMATION *mbi, size_t mbilen, size_t *got);
 
+NTSTATUS
+query_memory_image_extension(const byte *module_base,
+                             MEMORY_IMAGE_EXTENSION_INFORMATION *info, size_t *got);
+
 /* replacement for API call VirtualQuery */
 size_t
 query_virtual_memory(const byte *pc, MEMORY_BASIC_INFORMATION *mbi, size_t mbilen);
