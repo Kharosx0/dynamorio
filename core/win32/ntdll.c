@@ -2272,6 +2272,16 @@ nt_remote_query_virtual_memory(HANDLE process, const byte *pc,
                       mbilen, (PSIZE_T)got);
 }
 
+NTSTATUS
+query_memory_image_extension(const byte *module_base,
+                             MEMORY_IMAGE_EXTENSION_INFORMATION *info, size_t *got)
+{
+    memset(info, 0, sizeof(*info));
+    *got = 0;
+    return NT_SYSCALL(QueryVirtualMemory, NT_CURRENT_PROCESS, module_base,
+                      MemoryImageExtensionInformation, info, sizeof(*info), (PSIZE_T)got);
+}
+
 /* We use this instead of VirtualQuery b/c there are problems using
  * win32 API routines inside of the app using them
  */
