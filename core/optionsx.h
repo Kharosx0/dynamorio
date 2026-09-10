@@ -440,6 +440,11 @@ OPTION_DEFAULT_INTERNAL(bool, privlib_privheap, true,
  */
 OPTION_DEFAULT_INTERNAL(bool, private_peb, true,
                         "use private PEB + TEB fields for private libraries")
+/* Allows disabling the Windows image function-override compatibility repair
+ * if a future OS changes the currently supported metadata or extension layout.
+ */
+OPTION_DEFAULT_INTERNAL(bool, privload_fix_function_overrides, true,
+                        "repair private library function-override branches")
 #    endif
 
 /* PR 200418: Code Manipulation API.  This option enables the code

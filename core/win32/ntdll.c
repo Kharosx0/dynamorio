@@ -2273,9 +2273,11 @@ nt_remote_query_virtual_memory(HANDLE process, const byte *pc,
 }
 
 NTSTATUS
-query_memory_image_extension(const byte *module_base,
-                             MEMORY_IMAGE_EXTENSION_INFORMATION *info, size_t *got)
+query_memory_image_extension(DR_PARAM_IN const byte *module_base,
+                             MEMORY_IMAGE_EXTENSION_INFORMATION *info DR_PARAM_OUT,
+                             size_t *got DR_PARAM_OUT)
 {
+    ASSERT(module_base != NULL && info != NULL && got != NULL);
     memset(info, 0, sizeof(*info));
     *got = 0;
     return NT_SYSCALL(QueryVirtualMemory, NT_CURRENT_PROCESS, module_base,

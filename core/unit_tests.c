@@ -62,7 +62,7 @@ void
 unit_test_drwinapi(void);
 #    if defined(X86) && defined(X64)
 void
-unit_test_loader(void);
+unit_test_win32_loader(void);
 #    endif
 #endif
 void
@@ -94,7 +94,7 @@ main(int argc, char **argv, char **envp)
     unit_test_vmareas();
 #ifdef WINDOWS
 #    if defined(X86) && defined(X64)
-    unit_test_loader();
+    unit_test_win32_loader();
 #    endif
     unit_test_drwinapi();
 #endif
