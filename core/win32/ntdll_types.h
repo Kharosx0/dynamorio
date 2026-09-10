@@ -106,7 +106,8 @@ typedef enum _MEMORY_INFORMATION_CLASS {
 } MEMORY_INFORMATION_CLASS;
 
 /* Windows 11 24H2 added image-extension queries used for per-image CFG
- * support.  These definitions are not yet available in the Windows SDK.
+ * support.  These definitions are not yet available in the Windows SDK and
+ * were validated against Windows builds 26100 and 26200.
  */
 typedef enum _MEMORY_IMAGE_EXTENSION_TYPE {
     MemoryImageExtensionCfgScp,
